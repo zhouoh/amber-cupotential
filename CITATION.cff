@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+title: "amber-cupotential: Whole-Step NVIDIA cuPotential Acceleration Patch for Amber24 pmemd.cuda_SPFP"
+message: "If you use this integration patch in your research, please cite this repository along with Amber24 and NVIDIA cuPotential."
+type: software
+authors:
+  - family-names: Zhou
+    given-names: Contributors
+repository-code: "https://github.com/your-org/amber-cupotential"
+license: Apache-2.0
+keywords:
+  - molecular-dynamics
+  - amber
+  - pmemd
+  - cupotential
+  - cuda
+  - cuda-graphs
+abstract: >-
+  Out-of-tree source patch and runtime bridge integrating NVIDIA cuPotential
+  (PME nonbonded prolate/Ewald splitting and fused FP32 bonded tuples) with
+  a pure-FP32 fltflt GPU integrator, analytical SETTLE, star-SHAKE/RATTLE,
+  and multi-step CUDA Graph batching for Amber24 pmemd.cuda_SPFP.

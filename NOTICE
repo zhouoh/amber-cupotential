@@ -1,0 +1,67 @@
+amber-cupotential
+=================
+
+Unless otherwise noted, original integration sources, scripts, tests, and
+documentation in this repository are licensed under the Apache License,
+Version 2.0 (see LICENSE).
+
+"This software contains source code provided by NVIDIA Corporation."
+
+===============================================================================
+1. src/cupo_fltflt.cuh (BSD 3-Clause License)
+===============================================================================
+
+Adapted from NVIDIA cuPotential
+(`plugins/openmm/cpp/platforms/cuda/src/integrator/fltflt.hpp`):
+
+BSD 3-Clause License
+
+Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+===============================================================================
+2. External Dependencies (NOT Distributed in This Repository)
+===============================================================================
+
+This repository contains NO source code or binaries from Amber / PMEMD and NO
+proprietary runtime binaries or headers from NVIDIA cuPotential:
+
+- Amber 24 / PMEMD (`pmemd.cuda_SPFP`): Copyright (c) Regents of the University
+  of California, governed by the Amber 24 Software License Agreement. Users must
+  supply their own licensed Amber 24 source tree locally before running
+  `scripts/patch_amber24.py`.
+- NVIDIA cuPotential runtime (`include/cupo/`, `libcupo.so`) and CUDA 13
+  runtime shared libraries (`libcudart.so.13`, `libnvrtc.so.13`,
+  `libnvrtc-builtins.so.13*`, `libnvJitLink.so.13`, `libcufft.so.12`): NVIDIA
+  proprietary software governed by the NVIDIA Software License Agreement for
+  cuPotential Runtime (`LICENSE-cupo.txt` in NVIDIA/cuPotential) and NVIDIA CUDA
+  EULA. Users download these separately via `scripts/fetch_deps.sh`. Note in
+  particular NVIDIA Software License Agreement Section 2.12 regarding prior
+  written permission from NVIDIA before publicly disclosing benchmark,
+  competitive analysis, or performance data obtained with the early-access
+  cuPotential runtime.

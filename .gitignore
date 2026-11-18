@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.orig
+deps/
+build/
+*_runs/
+*.json
+.DS_Store
