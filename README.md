@@ -1,12 +1,12 @@
 # amber-cupotential
 
-Out-of-tree integration bringing **NVIDIA cuPotential** acceleration to **Amber 24 `pmemd.cuda_SPFP`** (single-GPU PME SPFP engine).
+Out-of-tree integration bringing **NVIDIA cuPotential** acceleration to **Amber 22 & Amber 24 `pmemd.cuda_SPFP`** (single-GPU PME SPFP engine), including **ff19SB CMAP** and **4/5-site Extra Point water models (OPC, TIP4P-Ew/2005, TIP5P)**.
 
 > **中文说明**: 请参阅 [README_zh.md](README_zh.md)。
 
 > [!IMPORTANT]
 > **Compliance & Licensing Notice**
-> - **Amber / PMEMD**: This repository contains **zero Amber source code or binaries**. Users must hold a valid Amber 24 license and apply `scripts/patch_amber24.py` to their local Amber 24 source tree.
+> - **Amber / PMEMD**: This repository contains **zero Amber source code or binaries**. Users must hold a valid Amber 22 or Amber 24 license and apply `scripts/patch_amber.py` to their local Amber source tree.
 > - **NVIDIA cuPotential Runtime (`libcupo.so`)**: Proprietary binaries and C headers from [`NVIDIA/cuPotential`](https://github.com/NVIDIA/cuPotential) are **not bundled** here; `scripts/fetch_deps.sh` downloads them separately under the NVIDIA Software License Agreement for cuPotential Runtime (`LICENSE-cupo.txt`). Note in particular **Section 2.12** of `LICENSE-cupo.txt`, which restricts public disclosure of benchmarking, competitive analysis, or performance data obtained with the early-access cuPotential runtime without prior written permission from NVIDIA.
 
 ---
@@ -39,6 +39,16 @@ Measured with `pmemd.cuda_SPFP` + `libcupo 0.3.5` (`chunk=8` CUDA Graph, steady-
 | NPT MC100 (`cut=9 Å, dt=2 fs`) | `354.72` | `643.96` | — | **`1033.96`** | **`2.91x`** | `883.35` |
 | NVT HMR Middle (`cut=9 Å, dt=4 fs`) | `596.30` | `1220.08` | `1412.56` | **`2414.06`** | **`4.05x`** | `1992.20` |
 
+**`ff19SB + OPC` 4-Point Water & Amber 22 Parity (20k steps, `cut=8 Å, dt=2 fs`)**
+
+| System & Engine | Protocol | Stock | Phase 2 Whole-Step (Prolate) | Speedup | Phase 2 (Ewald) | Speedup |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **DHFR (`ff19SB + OPC`, 29,048 atoms) — Amber 24** | NVT Langevin | `595.29` | **`2644.61`** | **`4.44x`** | `2201.73` | `3.70x` |
+| **DHFR (`ff19SB + OPC`, 29,048 atoms) — Amber 24** | NPT MC100 | `575.77` | **`2087.93`** | **`3.63x`** | `1823.20` | `3.17x` |
+| **DHFR (`ff19SB + OPC`, 29,048 atoms) — Amber 22** | NVT Langevin | `621.18` | **`2602.17`** | **`4.19x`** | `2172.62` | `3.50x` |
+| **DHFR (`ff19SB + OPC`, 29,048 atoms) — Amber 22** | NPT MC100 | `605.13` | **`2170.43`** | **`3.59x`** | `1885.87` | `3.12x` |
+| **JAC (`ff14SB + TIP3P`, 23,558 atoms) — Amber 22** | NVT Langevin | `789.48` | **`3497.64`** | **`4.43x`** | `2760.01` | `3.50x` |
+
 ### 2. Long-Timescale 100 ns `JAC` NPT Structural & Thermodynamic Validation
 
 Continuous **100.0 ns (`50,000,000` steps, `dt=2 fs`, `cut=8 Å`, `barostat=2, mcbarint=100`, `300 K`)** production trajectories comparing Phase 2 Whole-Step (`Prolate, chunk=8`) against Stock Amber24 `pmemd.cuda_SPFP`, analyzed over the steady-state window **`20–100 ns`** (1,600 frames):
@@ -61,17 +71,19 @@ Continuous **100.0 ns (`50,000,000` steps, `dt=2 fs`, `cut=8 Å`, `barostat=2, m
 
 ## Architecture Overview
 
-Rather than relying on CUDA IPC or OpenMM wrappers, `amber-cupotential` bridges directly into Amber 24's `pmemd.cuda_SPFP` GPU context (`gpuContext`) across three stages:
+Rather than relying on CUDA IPC or OpenMM wrappers, `amber-cupotential` bridges directly into Amber 22 / Amber 24's `pmemd.cuda_SPFP` GPU context (`gpuContext`) across three stages:
 
 1. **Phase 1 — Nonbonded PME (`cupo_dspace` + `cupo_kspace`)**
-   - Dynamically loads CUDA 13 runtime shared libraries (`libcudart.so.13`, `libnvrtc.so.13`, `libnvrtc-builtins.so.13*`, `libnvJitLink.so.13`, `libcufft.so.12`) and `libcupo.so` via `dlopen(..., RTLD_LOCAL | RTLD_DEEPBIND)`, allowing CUDA 11/12 Amber 24 builds to execute CUDA 13 cuPotential kernels without symbol collisions.
+   - Dynamically loads CUDA 13 runtime shared libraries (`libcudart.so.13`, `libnvrtc.so.13`, `libnvrtc-builtins.so.13*`, `libnvJitLink.so.13`, `libcufft.so.12`) and `libcupo.so` via `dlopen(..., RTLD_LOCAL | RTLD_DEEPBIND)`, allowing CUDA 11.8 (Amber 22) and CUDA 12.x (Amber 24) builds to execute CUDA 13 cuPotential kernels without symbol collisions.
    - Maps Amber's step-0 Hilbert image order and exclusion lists, supporting both **prolate** (default radial-truncated compact convolution) and **ewald** splitting (`AMBER_CUPO_SPLITTING=prolate|ewald`).
-2. **Stage 2A — Fused FP32 Bonded & 1–4 Nonbonded (`cupo_tuples`)**
-   - Compiles harmonic bonds (including Urey–Bradley bonds), harmonic angles, periodic dihedrals, and non-excluded 1–4 Coulomb/Lennard–Jones pairs into `cupo_tuples_*` batches whenever energy evaluation is not requested (`!needEnergy`).
-3. **Stage 2B — Pure-FP32 `fltflt` GPU Integrators & Multi-Step CUDA Graph (`runmd.F90` + `cupo_integrator`)**
+2. **Stage 2A — Fused FP32 Bonded, 1–4 Nonbonded & CMAP (`cupo_tuples` + `kCupoCmapForces_kernel`)**
+   - Compiles harmonic bonds (including Urey–Bradley bonds), harmonic angles, periodic dihedrals, and non-excluded 1–4 Coulomb/LJ pairs into `cupo_tuples_*` batches whenever energy evaluation is not requested (`!needEnergy`).
+   - Evaluates **ff19SB CMAP** bicubic Hermite spline forces natively via `kCupoCmapForces_kernel` in parallel on `misc_stream` (`BOND / ANGLE / DIHED / 1-4 / CMAP` single-step energies match Stock Amber to `0.0 kcal/mol`, CMAP atom force `RMSE = 9.43×10⁻⁴ kcal/(mol·Å)`).
+3. **Stage 2B — Pure-FP32 `fltflt` GPU Integrators, Virtual Sites & Multi-Step CUDA Graph (`runmd.F90` + `cupo_integrator`)**
    - Keeps step-to-step positions and `fltflt` (double-float, rounded with PTX/device intrinsics safe under `-use_fast_math`) velocity accumulators resident on GPU.
-   - Implements counter-based Philox 4x32-10 + Box–Muller thermostat noise (`CUPO_INTEG_MIDDLE`, `CUPO_INTEG_LEAPFROG_LANGEVIN`, `CUPO_INTEG_LEAPFROG_VERLET`), analytical closed-form `SETTLE` for rigid 3-site waters, 1..4-H star-`SHAKE`/`RATTLE`, `vlimit` clamping, and fixed-point net-force removal.
-   - Captures and replays `chunk=8` (`AMBER_CUPO_CHUNK`) whole-step CUDA super-graphs across `runmd.F90` between output, trajectory, restart, and MC barostat intervals (`cupo_pmemd_try_run_batch`).
+   - Implements counter-based Philox 4x32-10 + Box–Muller thermostat noise (`CUPO_INTEG_MIDDLE`, `CUPO_INTEG_LEAPFROG_LANGEVIN`, `CUPO_INTEG_LEAPFROG_VERLET`), analytical closed-form `SETTLE` for rigid 3/4-site waters, 1..4-H star-`SHAKE`/`RATTLE`, `vlimit` clamping, and fixed-point net-force removal (excluding massless virtual sites).
+   - Supports standard Extra Points (`EP11`, `EP12`, `EP21`, `EP22`, e.g., **OPC**, TIP4P*, TIP5P, lone pairs) via GPU-resident `kWholeOrientForces_kernel` force commutation and `double`-precision `kWholeLocalToGlobal_kernel` reconstruction (`|O–EP|` & bisector agreement `~5×10⁻¹⁵ Å` over 5k–10k NVE/NVT/NPT steps).
+   - Captures and replays `chunk=8` (`AMBER_CUPO_CHUNK`) whole-step CUDA super-graphs across `runmd.F90` between output, trajectory, restart, and MC barostat intervals (`cupo_pmemd_try_run_batch`), with `CUDART_VERSION` guards supporting CUDA 11.8 and CUDA 12.x.
 
 ---
 
@@ -81,12 +93,12 @@ Any simulation feature outside the supported path **automatically and safely fal
 
 | Feature / Mode | Acceleration Tier | Notes |
 | --- | --- | --- |
-| Explicit-solvent PME, `ntt=3` Langevin (`ischeme=0`) | **Phase 2 Whole-Step (`chunk=8` Graph)** | Orthogonal & triclinic boxes; Lorentz–Berthelot LJ |
+| Explicit-solvent PME (`ff14SB` / `ff19SB` CMAP, TIP3P / **OPC** / TIP4P* / TIP5P), `ntt=3` Langevin | **Phase 2 Whole-Step (`chunk=8` Graph)** | Orthogonal & triclinic boxes; Lorentz–Berthelot LJ |
 | Explicit-solvent PME, `ischeme=1, ithermostat=1` Middle (incl. HMR 4 fs) | **Phase 2 Whole-Step (`chunk=8` Graph)** | Supports 2 fs and 4 fs HMR (`parmed` HMassRepartition) |
-| Explicit-solvent PME, `ntt=0` NVE | **Phase 2 Whole-Step (`chunk=8` Graph)** | Analytical SETTLE + star-SHAKE/RATTLE |
+| Explicit-solvent PME, `ntt=0` NVE | **Phase 2 Whole-Step (`chunk=8` Graph)** | Analytical SETTLE + star-SHAKE/RATTLE + EP force commutation |
 | Explicit-solvent PME, `ntp>0, barostat=2` (Monte Carlo barostat) | **Phase 2 Whole-Step between MC trials** | Automatic box resize & `kspace_refresh_influence` on accepted moves |
 | Single-step force/energy (`imin=0`, print/restart/MC trial steps) | **Phase 1 + Stage 2A** (Forces) / **Phase 1 + Amber Bonded** (Energy) | Bitwise consistent single-step fallback |
-| `AMBER_USE_CUPO=0`, `imin=1` (minimization), `ntb=0` (implicit solvent), `ntt=1` (Berendsen T), `barostat=1` (Berendsen P), `ti_mode!=0`, `ntr=1`, NMR restraints, CMAP, NBFIX, LJ 12-6-4, GaMD, NFE/PLUMED, constant pH/E, Extra Points | **Automatic Stock Fallback** | Handled natively by stock `pmemd.cuda_SPFP` |
+| `AMBER_USE_CUPO=0`, `imin=1` (minimization), `ntb=0` (implicit solvent), `ntt=1` (Berendsen T), `barostat=1` (Berendsen P), `ti_mode!=0`, `ntr=1`, NMR restraints, CHARMM impropers (`impDihedrals>0`), `EPCustomCount>0`, NBFIX, LJ 12-6-4, GaMD, NFE/PLUMED, constant pH/E | **Automatic Stock Fallback** | Handled natively by stock `pmemd.cuda_SPFP` |
 | MPI multi-GPU (`pmemd.cuda_SPFP.MPI`), `pmemd.cuda_DPFP`, HIP/AMD | **Compiled as No-Op Stubs** | Preserves multi-target Amber CMake builds cleanly |
 
 ---
@@ -94,7 +106,7 @@ Any simulation feature outside the supported path **automatically and safely fal
 ## 5-Minute Quickstart
 
 ### Prerequisites
-- Licensed **Amber 24** source tree (`amber24_src`), CMake + CUDA Toolkit + GCC/GFortran
+- Licensed **Amber 22** or **Amber 24** source tree (`amber22_src` / `amber24_src`), CMake + CUDA Toolkit (11.8+ or 12.x) + GCC/GFortran
 - Python 3.9+ (with `pip` for fetching CUDA 13 runtime wheels; `numpy` + `scipy` for running `tests/verify_integration.py`)
 - NVIDIA GPU compute capability supported by `libcupo` (`sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90`, `sm_100`, `sm_103`, `sm_120`; see upstream `runtime_build.json`)
 
@@ -106,19 +118,21 @@ Any simulation feature outside the supported path **automatically and safely fal
 ./scripts/fetch_deps.sh --verify-only --dest /path/to/cuPotential
 ```
 
-### 2. Inject Hooks into Amber 24 Source Tree
+### 2. Inject Hooks into Amber 22 or Amber 24 Source Tree
 
 ```bash
 # Dry-run anchor verification (writes nothing)
-./scripts/patch_amber24.py --amber-src /path/to/amber24_src --check
+./scripts/patch_amber.py --amber-src /path/to/amber_src --check
 
 # Apply hooks (creates .cupo.orig backups alongside the 4 modified files)
-./scripts/patch_amber24.py --amber-src /path/to/amber24_src --apply
+./scripts/patch_amber.py --amber-src /path/to/amber_src --apply
 
 # Optional: inspect status or cleanly revert at any time
-./scripts/patch_amber24.py --amber-src /path/to/amber24_src --status
-./scripts/patch_amber24.py --amber-src /path/to/amber24_src --revert
+./scripts/patch_amber.py --amber-src /path/to/amber_src --status
+./scripts/patch_amber.py --amber-src /path/to/amber_src --revert
 ```
+
+> (`scripts/patch_amber24.py` remains as a backward-compatible alias to `scripts/patch_amber.py`.)
 
 ### 3. Build `pmemd.cuda_SPFP`
 
@@ -187,6 +201,6 @@ You can also validate directly against your own biomolecular system:
 - `src/` — Standalone integration sources (`Apache-2.0`, except `cupo_fltflt.cuh` under `BSD-3-Clause`):
   - `cupo_fltflt.cuh`, `cupo_integrator.h`, `cupo_integrator.cu`, `cupo_nonbond.h`, `cupo_nonbond.cu`
 - `scripts/fetch_deps.sh` — Downloads official `NVIDIA/cuPotential` + PyPI CUDA 13 runtime shared libraries
-- `scripts/patch_amber24.py` — Anchor-based injector/reverter for Amber 24 `src/pmemd`
-- `tests/verify_integration.py` — End-to-end accuracy, conservation, constraint, graph equivalence, and fallback suite
+- `scripts/patch_amber.py` — Anchor-based injector/reverter for Amber 22 & Amber 24 `src/pmemd` (`patch_amber24.py` kept as alias)
+- `tests/verify_integration.py` — End-to-end accuracy, conservation, constraint/EP, graph equivalence, and fallback suite
 - `benchmarks/run_benchmark.py` — Local throughput comparison harness

@@ -37,6 +37,19 @@ struct CupoShakeCluster {
   float wp;
 };
 
+struct CupoEpFrame {
+  int ep1;
+  int ep2;
+  int frame_x;  // parent_atm (image index)
+  int frame_y;  // frame_atm1 (image index)
+  int frame_z;  // frame_atm2 (image index)
+  int frame_w;  // frame_atm3 (image index)
+  int type;     // 1 = EP_TYPE1, 2 = EP_TYPE2
+  int pad;
+  double x1, y1, z1;  // local coords in nm
+  double x2, y2, z2;  // local coords in nm (unused if ep2 < 0)
+};
+
 struct CupoSettleShapeConsts {
   fltflt ra;
   fltflt rb;
@@ -481,12 +494,15 @@ __global__ void kWholeSumNetForce_kernel(
 }
 
 __global__ void kWholeSubNetForce_kernel(
-    int natoms, int stride,
+    int natoms, int n_real_atoms, int stride,
+    const ff4a* __restrict__ vel,
     unsigned long long* __restrict__ force,
     const long long* __restrict__ net_force) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= natoms) return;
-  const double inv_n = 1.0 / static_cast<double>(natoms);
+  const ff4 v = loadFf4a(vel, i);
+  if (v.w.hi == 0.0f && v.w.lo == 0.0f) return;
+  const double inv_n = 1.0 / static_cast<double>(n_real_atoms);
   const long long cx = llrint(static_cast<double>(net_force[0]) * inv_n);
   const long long cy = llrint(static_cast<double>(net_force[1]) * inv_n);
   const long long cz = llrint(static_cast<double>(net_force[2]) * inv_n);
@@ -495,6 +511,270 @@ __global__ void kWholeSubNetForce_kernel(
       static_cast<unsigned long long>(static_cast<long long>(force[i + stride]) - cy);
   force[i + 2 * stride] =
       static_cast<unsigned long long>(static_cast<long long>(force[i + 2 * stride]) - cz);
+}
+
+static __device__ __forceinline__ void loadPosDouble(
+    const float4* __restrict__ posq,
+    const float4* __restrict__ posq_corr,
+    int atom,
+    double& x, double& y, double& z) {
+  const float4 p = posq[atom];
+  const float4 c = posq_corr[atom];
+  x = static_cast<double>(p.x) + static_cast<double>(c.x);
+  y = static_cast<double>(p.y) + static_cast<double>(c.y);
+  z = static_cast<double>(p.z) + static_cast<double>(c.z);
+}
+
+static __device__ __forceinline__ void storePosDoublePreserveCharge(
+    float4* __restrict__ posq,
+    float4* __restrict__ posq_corr,
+    int atom,
+    double x, double y, double z) {
+  const fltflt fx(x);
+  const fltflt fy(y);
+  const fltflt fz(z);
+  const float q = posq[atom].w;
+  posq[atom] = make_float4(fx.hi, fy.hi, fz.hi, q);
+  posq_corr[atom] = make_float4(fx.lo, fy.lo, fz.lo, 0.0f);
+}
+
+static __device__ __forceinline__ void addCupoFixedForce(
+    unsigned long long* __restrict__ force,
+    int atom, int stride,
+    double fx, double fy, double fz) {
+  atomicAdd(force + atom, static_cast<unsigned long long>(llrint(fx)));
+  atomicAdd(force + atom + stride, static_cast<unsigned long long>(llrint(fy)));
+  atomicAdd(force + atom + 2 * stride, static_cast<unsigned long long>(llrint(fz)));
+}
+
+// Reconstruct extra-point global coordinates from parent/frame atoms in nm (kLocalToGlobalLoop.h).
+__global__ void kWholeLocalToGlobal_kernel(
+    int nframes,
+    const CupoEpFrame* __restrict__ frames,
+    float4* __restrict__ posq,
+    float4* __restrict__ posq_corr) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= nframes) return;
+
+  const CupoEpFrame fr = frames[idx];
+  double ax, ay, az, bx, by, bz, cx, cy, cz;
+  if (fr.type == 1) {
+    loadPosDouble(posq, posq_corr, fr.frame_y, ax, ay, az);
+    loadPosDouble(posq, posq_corr, fr.frame_z, bx, by, bz);
+    loadPosDouble(posq, posq_corr, fr.frame_w, cx, cy, cz);
+  } else {
+    double px, py, pz;
+    loadPosDouble(posq, posq_corr, fr.frame_z, px, py, pz);
+    loadPosDouble(posq, posq_corr, fr.frame_y, ax, ay, az);
+    loadPosDouble(posq, posq_corr, fr.frame_w, cx, cy, cz);
+    loadPosDouble(posq, posq_corr, fr.frame_x, bx, by, bz);
+    ax = 0.5 * (ax + px);
+    ay = 0.5 * (ay + py);
+    az = 0.5 * (az + pz);
+    cx = 0.5 * (cx + px);
+    cy = 0.5 * (cy + py);
+    cz = 0.5 * (cz + pz);
+  }
+
+  const double uvecx = ax - bx;
+  const double uvecy = ay - by;
+  const double uvecz = az - bz;
+  const double usiz = rsqrt(uvecx * uvecx + uvecy * uvecy + uvecz * uvecz);
+  const double vvecx = cx - bx;
+  const double vvecy = cy - by;
+  const double vvecz = cz - bz;
+  const double vsiz = rsqrt(vvecx * vvecx + vvecy * vvecy + vvecz * vvecz);
+
+  const double ux = uvecx * usiz;
+  const double uy = uvecy * usiz;
+  const double uz = uvecz * usiz;
+  const double vx = vvecx * vsiz;
+  const double vy = vvecy * vsiz;
+  const double vz = vvecz * vsiz;
+
+  const double avex = 0.5 * (ux + vx);
+  const double avey = 0.5 * (uy + vy);
+  const double avez = 0.5 * (uz + vz);
+  const double diffx = 0.5 * (vx - ux);
+  const double diffy = 0.5 * (vy - uy);
+  const double diffz = 0.5 * (vz - uz);
+
+  const double asiz = rsqrt(avex * avex + avey * avey + avez * avez);
+  const double dsiz = rsqrt(diffx * diffx + diffy * diffy + diffz * diffz);
+
+  const double f13 = -avex * asiz;
+  const double f23 = -avey * asiz;
+  const double f33 = -avez * asiz;
+  const double f11 = diffx * dsiz;
+  const double f21 = diffy * dsiz;
+  const double f31 = diffz * dsiz;
+  const double f12 = f23 * f31 - f33 * f21;
+  const double f22 = f33 * f11 - f13 * f31;
+  const double f32 = f13 * f21 - f23 * f11;
+
+  storePosDoublePreserveCharge(
+      posq, posq_corr, fr.ep1,
+      bx + f11 * fr.x1 + f12 * fr.y1 + f13 * fr.z1,
+      by + f21 * fr.x1 + f22 * fr.y1 + f23 * fr.z1,
+      bz + f31 * fr.x1 + f32 * fr.y1 + f33 * fr.z1);
+
+  if (fr.ep2 >= 0) {
+    storePosDoublePreserveCharge(
+        posq, posq_corr, fr.ep2,
+        bx + f11 * fr.x2 + f12 * fr.y2 + f13 * fr.z2,
+        by + f21 * fr.x2 + f22 * fr.y2 + f23 * fr.z2,
+        bz + f31 * fr.x2 + f32 * fr.y2 + f33 * fr.z2);
+  }
+}
+
+// Distribute extra-point forces onto parent/frame atoms and zero EP force slots (kOrientForcesLoop.h).
+__global__ void kWholeOrientForces_kernel(
+    int nframes,
+    const CupoEpFrame* __restrict__ frames,
+    const float4* __restrict__ posq,
+    const float4* __restrict__ posq_corr,
+    unsigned long long* __restrict__ force,
+    int stride) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= nframes) return;
+
+  const CupoEpFrame fr = frames[idx];
+  const int s1 = stride;
+  const int s2 = 2 * stride;
+
+  double x1, y1, z1, xp, yp, zp;
+  loadPosDouble(posq, posq_corr, fr.ep1, x1, y1, z1);
+  loadPosDouble(posq, posq_corr, fr.frame_x, xp, yp, zp);
+
+  double forceX = static_cast<double>(static_cast<long long>(force[fr.ep1]));
+  double forceY = static_cast<double>(static_cast<long long>(force[fr.ep1 + s1]));
+  double forceZ = static_cast<double>(static_cast<long long>(force[fr.ep1 + s2]));
+  force[fr.ep1] = 0ULL;
+  force[fr.ep1 + s1] = 0ULL;
+  force[fr.ep1 + s2] = 0ULL;
+
+  double rx = x1 - xp;
+  double ry = y1 - yp;
+  double rz = z1 - zp;
+  double torqueX = ry * forceZ - rz * forceY;
+  double torqueY = rz * forceX - rx * forceZ;
+  double torqueZ = rx * forceY - ry * forceX;
+
+  if (fr.ep2 >= 0) {
+    double x2, y2, z2;
+    loadPosDouble(posq, posq_corr, fr.ep2, x2, y2, z2);
+    const double forceX2 = static_cast<double>(static_cast<long long>(force[fr.ep2]));
+    const double forceY2 = static_cast<double>(static_cast<long long>(force[fr.ep2 + s1]));
+    const double forceZ2 = static_cast<double>(static_cast<long long>(force[fr.ep2 + s2]));
+    force[fr.ep2] = 0ULL;
+    force[fr.ep2 + s1] = 0ULL;
+    force[fr.ep2 + s2] = 0ULL;
+
+    rx = x2 - xp;
+    ry = y2 - yp;
+    rz = z2 - zp;
+    forceX += forceX2;
+    forceY += forceY2;
+    forceZ += forceZ2;
+    torqueX += ry * forceZ2 - rz * forceY2;
+    torqueY += rz * forceX2 - rx * forceZ2;
+    torqueZ += rx * forceY2 - ry * forceX2;
+  }
+
+  double apx, apy, apz, bpx, bpy, bpz, cpx, cpy, cpz;
+  if (fr.type == 1) {
+    loadPosDouble(posq, posq_corr, fr.frame_y, apx, apy, apz);
+    loadPosDouble(posq, posq_corr, fr.frame_z, bpx, bpy, bpz);
+    loadPosDouble(posq, posq_corr, fr.frame_w, cpx, cpy, cpz);
+  } else {
+    double px, py, pz;
+    loadPosDouble(posq, posq_corr, fr.frame_y, apx, apy, apz);
+    loadPosDouble(posq, posq_corr, fr.frame_z, px, py, pz);
+    loadPosDouble(posq, posq_corr, fr.frame_w, cpx, cpy, cpz);
+    loadPosDouble(posq, posq_corr, fr.frame_x, bpx, bpy, bpz);
+    apx = 0.5 * (apx + px);
+    apy = 0.5 * (apy + py);
+    apz = 0.5 * (apz + pz);
+    cpx = 0.5 * (cpx + px);
+    cpy = 0.5 * (cpy + py);
+    cpz = 0.5 * (cpz + pz);
+  }
+
+  double ux = apx - bpx;
+  double uy = apy - bpy;
+  double uz = apz - bpz;
+  double usiz = rsqrt(ux * ux + uy * uy + uz * uz);
+  double vx = cpx - bpx;
+  double vy = cpy - bpy;
+  double vz = cpz - bpz;
+  double vsiz = rsqrt(vx * vx + vy * vy + vz * vz);
+  double wx = uy * vz - uz * vy;
+  double wy = uz * vx - ux * vz;
+  double wz = ux * vy - uy * vx;
+
+  ux *= usiz;
+  uy *= usiz;
+  uz *= usiz;
+  vx *= vsiz;
+  vy *= vsiz;
+  vz *= vsiz;
+  const double wsiz = rsqrt(wx * wx + wy * wy + wz * wz);
+  wx *= wsiz;
+  wy *= wsiz;
+  wz *= wsiz;
+
+  const double dx = vx - ux;
+  const double dy = vy - uy;
+  const double dz = vz - uz;
+  const double dotdu = ux * dx + uy * dy + uz * dz;
+  const double dotdv = vx * dx + vy * dy + vz * dz;
+  double upx = dx - dotdu * ux;
+  double upy = dy - dotdu * uy;
+  double upz = dz - dotdu * uz;
+  double vpx = dx - dotdv * vx;
+  double vpy = dy - dotdv * vy;
+  double vpz = dz - dotdv * vz;
+  const double upsiz = rsqrt(upx * upx + upy * upy + upz * upz);
+  upx *= upsiz;
+  upy *= upsiz;
+  upz *= upsiz;
+  const double vpsiz = rsqrt(vpx * vpx + vpy * vpy + vpz * vpz);
+  vpx *= vpsiz;
+  vpy *= vpsiz;
+  vpz *= vpsiz;
+
+  const double c = ux * vx + uy * vy + uz * vz;
+  const double s = rsqrt(fmax(1.0e-30, 1.0 - c * c));
+  const double uvdis = usiz * s;
+  const double vudis = vsiz * s;
+  double dphidu = -(torqueX * ux + torqueY * uy + torqueZ * uz);
+  double dphidv = -(torqueX * vx + torqueY * vy + torqueZ * vz);
+  const double dphidw = -(torqueX * wx + torqueY * wy + torqueZ * wz);
+  dphidv *= uvdis;
+  dphidu *= vudis;
+  usiz *= 0.5 * dphidw;
+  vsiz *= 0.5 * dphidw;
+
+  const double dux = -wx * dphidv + upx * usiz;
+  const double duy = -wy * dphidv + upy * usiz;
+  const double duz = -wz * dphidv + upz * usiz;
+  const double dvx = wx * dphidu + vpx * vsiz;
+  const double dvy = wy * dphidu + vpy * vsiz;
+  const double dvz = wz * dphidu + vpz * vsiz;
+
+  if (fr.type == 1) {
+    addCupoFixedForce(force, fr.frame_y, stride, -dux, -duy, -duz);
+    addCupoFixedForce(force, fr.frame_w, stride, -dvx, -dvy, -dvz);
+    addCupoFixedForce(force, fr.frame_z, stride, dvx + dux + forceX,
+                      dvy + duy + forceY, dvz + duz + forceZ);
+  } else {
+    addCupoFixedForce(force, fr.frame_x, stride, dvx + dux + forceX,
+                      dvy + duy + forceY, dvz + duz + forceZ);
+    addCupoFixedForce(force, fr.frame_y, stride, -0.5 * dux, -0.5 * duy, -0.5 * duz);
+    addCupoFixedForce(force, fr.frame_w, stride, -0.5 * dvx, -0.5 * dvy, -0.5 * dvz);
+    addCupoFixedForce(force, fr.frame_z, stride, -0.5 * (dvx + dux),
+                      -0.5 * (dvy + duy), -0.5 * (dvz + duz));
+  }
 }
 
 __global__ void kWholePackFromAmber_kernel(
@@ -897,9 +1177,11 @@ __global__ void __launch_bounds__(64) kWholeShakeVelOnly_kernel(
 struct CupoIntegratorState {
   CupoIntegMode mode = CUPO_INTEG_NONE;
   int natoms = 0;
+  int n_real_atoms = 0;
   int nfree = 0;
   int nsettle = 0;
   int nshake = 0;
+  int n_ep_frames = 0;
   bool has_constraints = false;
   float shake_tol = 1e-5f;
   float rattle_tol = 1e-5f;
@@ -914,6 +1196,7 @@ struct CupoIntegratorState {
   int* d_free_atoms = nullptr;
   int4* d_settle_atoms = nullptr;
   CupoShakeCluster* d_shake_clusters = nullptr;
+  CupoEpFrame* d_ep_frames = nullptr;
   unsigned int* d_step_count = nullptr;
   long long* d_net_force = nullptr;
   CupoIntegStepParams* d_step_params = nullptr;
@@ -973,10 +1256,115 @@ CupoIntegratorState* cupo_integrator_create(gpuContext gpu,
   std::vector<uint8_t> atom_owner(natoms, 0);
   std::vector<int4> h_settle;
   std::vector<CupoShakeCluster> h_shake;
+  std::vector<CupoEpFrame> h_ep_frames;
   CupoSettleShapeConsts sh_consts = {};
+  const double* sys_masses = gpu->pbAtomMass->_pSysData;
+
+  if (gpu->sim.EPs > 0) {
+    if (gpu->sim.EPCustomCount > 0) {
+      return fail("custom virtual sites (EPCustomCount > 0) not supported in whole-step mode");
+    }
+
+    auto epStride = [&](int cnt) -> int {
+      return ((cnt + (gpu->sim.grid - 1)) >> gpu->sim.gridBits) << gpu->sim.gridBits;
+    };
+    auto mapSysIdx = [&](int sys_idx, int* out_img) -> bool {
+      if (sys_idx < 0 || sys_idx >= natoms) return false;
+      *out_img = static_cast<int>(sys_to_img[sys_idx]);
+      return true;
+    };
+
+    auto appendOneEp = [&](int cnt, int type_val, GpuBuffer<int4>* fb,
+                           GpuBuffer<int>* ib, GpuBuffer<double>* cb) -> bool {
+      if (cnt <= 0) return true;
+      if (!fb || !ib || !cb) return false;
+      const int st = epStride(cnt);
+      for (int i = 0; i < cnt; ++i) {
+        const int ep_sys = ib->_pSysData[i];
+        const int4 fr_sys = fb->_pSysData[i];
+        CupoEpFrame fr = {};
+        fr.type = type_val;
+        fr.ep2 = -1;
+        if (!mapSysIdx(ep_sys, &fr.ep1) ||
+            !mapSysIdx(fr_sys.x, &fr.frame_x) ||
+            !mapSysIdx(fr_sys.y, &fr.frame_y) ||
+            !mapSysIdx(fr_sys.z, &fr.frame_z) ||
+            !mapSysIdx(fr_sys.w, &fr.frame_w)) {
+          return false;
+        }
+        if (std::fabs(sys_masses[ep_sys]) > 1e-8 || atom_owner[fr.ep1]) {
+          return false;
+        }
+        atom_owner[fr.ep1] = 3;
+        fr.x1 = kNmPerAngstrom * cb->_pSysData[i];
+        fr.y1 = kNmPerAngstrom * cb->_pSysData[i + st];
+        fr.z1 = kNmPerAngstrom * cb->_pSysData[i + 2 * st];
+        h_ep_frames.push_back(fr);
+      }
+      return true;
+    };
+
+    auto appendTwoEp = [&](int cnt, int type_val, GpuBuffer<int4>* fb,
+                           GpuBuffer<int2>* ib, GpuBuffer<double>* cb) -> bool {
+      if (cnt <= 0) return true;
+      if (!fb || !ib || !cb) return false;
+      const int st = epStride(cnt);
+      for (int i = 0; i < cnt; ++i) {
+        const int2 ep_sys = ib->_pSysData[i];
+        const int4 fr_sys = fb->_pSysData[i];
+        CupoEpFrame fr = {};
+        fr.type = type_val;
+        if (!mapSysIdx(ep_sys.x, &fr.ep1) ||
+            !mapSysIdx(ep_sys.y, &fr.ep2) ||
+            fr.ep1 == fr.ep2 ||
+            !mapSysIdx(fr_sys.x, &fr.frame_x) ||
+            !mapSysIdx(fr_sys.y, &fr.frame_y) ||
+            !mapSysIdx(fr_sys.z, &fr.frame_z) ||
+            !mapSysIdx(fr_sys.w, &fr.frame_w)) {
+          return false;
+        }
+        if (std::fabs(sys_masses[ep_sys.x]) > 1e-8 ||
+            std::fabs(sys_masses[ep_sys.y]) > 1e-8 ||
+            atom_owner[fr.ep1] || atom_owner[fr.ep2]) {
+          return false;
+        }
+        atom_owner[fr.ep1] = 3;
+        atom_owner[fr.ep2] = 3;
+        fr.x1 = kNmPerAngstrom * cb->_pSysData[i];
+        fr.y1 = kNmPerAngstrom * cb->_pSysData[i + st];
+        fr.z1 = kNmPerAngstrom * cb->_pSysData[i + 2 * st];
+        fr.x2 = kNmPerAngstrom * cb->_pSysData[i + 3 * st];
+        fr.y2 = kNmPerAngstrom * cb->_pSysData[i + 4 * st];
+        fr.z2 = kNmPerAngstrom * cb->_pSysData[i + 5 * st];
+        h_ep_frames.push_back(fr);
+      }
+      return true;
+    };
+
+    h_ep_frames.reserve(static_cast<size_t>(gpu->sim.EPs));
+    if (!appendOneEp(gpu->sim.EP11s, 1, gpu->pbExtraPoint11Frame,
+                     gpu->pbExtraPoint11Index, gpu->pbExtraPoint11) ||
+        !appendOneEp(gpu->sim.EP12s, 2, gpu->pbExtraPoint12Frame,
+                     gpu->pbExtraPoint12Index, gpu->pbExtraPoint12) ||
+        !appendTwoEp(gpu->sim.EP21s, 1, gpu->pbExtraPoint21Frame,
+                     gpu->pbExtraPoint21Index, gpu->pbExtraPoint21) ||
+        !appendTwoEp(gpu->sim.EP22s, 2, gpu->pbExtraPoint22Frame,
+                     gpu->pbExtraPoint22Index, gpu->pbExtraPoint22)) {
+      return fail("invalid, non-zero-mass, or overlapping extra point frame");
+    }
+  }
+
+  int n_real_atoms = 0;
+  for (int sys = 0; sys < natoms; ++sys) {
+    if (sys_masses[sys] > 0.0) {
+      n_real_atoms++;
+    }
+  }
+  if (n_real_atoms <= 0) {
+    n_real_atoms = natoms;
+  }
 
   if (gpu->ntc > 1) {
-    const double* sys_masses = gpu->pbAtomMass->_pSysData;
 
     // Fast water SETTLE clusters.
     if (gpu->sim.fastShakeConstraints > 0) {
@@ -1119,9 +1507,11 @@ CupoIntegratorState* cupo_integrator_create(gpuContext gpu,
   CupoIntegratorState* s = new CupoIntegratorState();
   s->mode = mode;
   s->natoms = natoms;
+  s->n_real_atoms = n_real_atoms;
   s->nfree = static_cast<int>(h_free.size());
   s->nsettle = static_cast<int>(h_settle.size());
   s->nshake = static_cast<int>(h_shake.size());
+  s->n_ep_frames = static_cast<int>(h_ep_frames.size());
   s->has_constraints = (s->nsettle > 0 || s->nshake > 0);
   s->shake_tol = static_cast<float>(gpu->sim.tol > 0.0 ? gpu->sim.tol : 1e-5);
   s->rattle_tol = (s->shake_tol < 1e-5f) ? s->shake_tol : 1e-5f;
@@ -1152,6 +1542,13 @@ CupoIntegratorState* cupo_integrator_create(gpuContext gpu,
                                      static_cast<size_t>(s->nshake) * sizeof(CupoShakeCluster)));
     CUPO_INTEG_CUDA_CHECK(cudaMemcpy(s->d_shake_clusters, h_shake.data(),
                                      static_cast<size_t>(s->nshake) * sizeof(CupoShakeCluster),
+                                     cudaMemcpyHostToDevice));
+  }
+  if (s->n_ep_frames > 0) {
+    CUPO_INTEG_CUDA_CHECK(cudaMalloc(&s->d_ep_frames,
+                                     static_cast<size_t>(s->n_ep_frames) * sizeof(CupoEpFrame)));
+    CUPO_INTEG_CUDA_CHECK(cudaMemcpy(s->d_ep_frames, h_ep_frames.data(),
+                                     static_cast<size_t>(s->n_ep_frames) * sizeof(CupoEpFrame),
                                      cudaMemcpyHostToDevice));
   }
 
@@ -1192,6 +1589,7 @@ void cupo_integrator_destroy(CupoIntegratorState* s) {
   if (s->d_free_atoms) cudaFree(s->d_free_atoms);
   if (s->d_settle_atoms) cudaFree(s->d_settle_atoms);
   if (s->d_shake_clusters) cudaFree(s->d_shake_clusters);
+  if (s->d_ep_frames) cudaFree(s->d_ep_frames);
   if (s->d_step_count) cudaFree(s->d_step_count);
   if (s->d_net_force) cudaFree(s->d_net_force);
   if (s->d_step_params) cudaFree(s->d_step_params);
@@ -1278,6 +1676,12 @@ void cupo_integrator_pack_from_amber(CupoIntegratorState* s,
       s->d_posq_corr,
       s->d_vel);
   CUPO_INTEG_CUDA_CHECK(cudaGetLastError());
+  if (s->n_ep_frames > 0) {
+    const int ep_blocks = (s->n_ep_frames + 127) / 128;
+    kWholeLocalToGlobal_kernel<<<ep_blocks, 128, 0, stream>>>(
+        s->n_ep_frames, s->d_ep_frames, d_posq, s->d_posq_corr);
+    CUPO_INTEG_CUDA_CHECK(cudaGetLastError());
+  }
 }
 
 void cupo_integrator_step(CupoIntegratorState* s,
@@ -1288,6 +1692,13 @@ void cupo_integrator_step(CupoIntegratorState* s,
                           cudaStream_t ws) {
   if (!s) return;
 
+  if (s->n_ep_frames > 0) {
+    const int ep_blocks = (s->n_ep_frames + 127) / 128;
+    kWholeOrientForces_kernel<<<ep_blocks, 128, 0, ws>>>(
+        s->n_ep_frames, s->d_ep_frames, d_posq, s->d_posq_corr, d_cupo_force, stride);
+    CUPO_INTEG_CUDA_CHECK(cudaGetLastError());
+  }
+
   if (apply_netfrc && s->mode == CUPO_INTEG_LEAPFROG_VERLET) {
     CUPO_INTEG_CUDA_CHECK(
         cudaMemsetAsync(s->d_net_force, 0, 3 * sizeof(long long), ws));
@@ -1296,7 +1707,7 @@ void cupo_integrator_step(CupoIntegratorState* s,
         s->natoms, stride, d_cupo_force, s->d_net_force);
     const int sblocks = (s->natoms + 255) / 256;
     kWholeSubNetForce_kernel<<<sblocks, 256, 0, ws>>>(
-        s->natoms, stride, d_cupo_force, s->d_net_force);
+        s->natoms, s->n_real_atoms, stride, s->d_vel, d_cupo_force, s->d_net_force);
     CUPO_INTEG_CUDA_CHECK(cudaGetLastError());
   }
 
@@ -1431,6 +1842,13 @@ void cupo_integrator_step(CupoIntegratorState* s,
   }
   if (need_shake_stream) {
     CUPO_INTEG_CUDA_CHECK(cudaStreamWaitEvent(ws, s->shake_done_evt, 0));
+  }
+
+  if (s->n_ep_frames > 0) {
+    const int ep_blocks = (s->n_ep_frames + 127) / 128;
+    kWholeLocalToGlobal_kernel<<<ep_blocks, 128, 0, ws>>>(
+        s->n_ep_frames, s->d_ep_frames, d_posq, s->d_posq_corr);
+    CUPO_INTEG_CUDA_CHECK(cudaGetLastError());
   }
 }
 

@@ -216,6 +216,53 @@ static uint64_t packPairKey(int a, int b) {
          static_cast<uint32_t>(hi);
 }
 
+// C++11 SFINAE accessors for fields introduced in Amber 24 that may be absent in Amber 22.
+template <typename T>
+static auto getIphmd(const T* obj, int) -> decltype(obj->iphmd, int()) {
+  return static_cast<int>(obj->iphmd);
+}
+template <typename T>
+static int getIphmd(const T*, long) {
+  return 0;
+}
+
+template <typename T>
+static auto getIsgld(const T* obj, int) -> decltype(obj->isgld, int()) {
+  return static_cast<int>(obj->isgld);
+}
+template <typename T>
+static int getIsgld(const T*, long) {
+  return 0;
+}
+
+template <typename T>
+static auto getNumberpLJ1264Atoms(const T* obj, int)
+    -> decltype(obj->numberpLJ1264Atoms, int()) {
+  return static_cast<int>(obj->numberpLJ1264Atoms);
+}
+template <typename T>
+static int getNumberpLJ1264Atoms(const T*, long) {
+  return 0;
+}
+
+template <typename T>
+static auto getNumberLJ1264pLJ1264Atoms(const T* obj, int)
+    -> decltype(obj->numberLJ1264pLJ1264Atoms, int()) {
+  return static_cast<int>(obj->numberLJ1264pLJ1264Atoms);
+}
+template <typename T>
+static int getNumberLJ1264pLJ1264Atoms(const T*, long) {
+  return 0;
+}
+
+static cudaError_t cupoGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph) {
+#if CUDART_VERSION >= 12000
+  return cudaGraphInstantiate(exec, graph, 0);
+#else
+  return cudaGraphInstantiate(exec, graph, nullptr, nullptr, 0);
+#endif
+}
+
 // ============================================================================
 // CUDA 13 + libcupo.so Dynamic Loader (Isolated via RTLD_LOCAL | RTLD_DEEPBIND)
 // ============================================================================
@@ -440,6 +487,250 @@ __global__ void kCupoAccumulateForces_kernel(
   }
 }
 
+struct CupoCmapTerm {
+  int a[5];
+  int type;
+};
+
+static __device__ __forceinline__ void addCmapAtomForce(
+    unsigned long long* __restrict__ force, int atom, int stride,
+    long long fx, long long fy, long long fz) {
+  atomicAdd(force + atom, static_cast<unsigned long long>(fx));
+  atomicAdd(force + atom + stride, static_cast<unsigned long long>(fy));
+  atomicAdd(force + atom + 2 * stride, static_cast<unsigned long long>(fz));
+}
+
+// Bicubic Hermite CMAP forces mirroring Amber kBWU_cmap.h, accumulated directly into
+// cuPotential's fixed-point 2^32 kJ/(mol*nm) force array.
+__global__ void kCupoCmapForces_kernel(
+    int ncmaps,
+    const CupoCmapTerm* __restrict__ terms,
+    const float4* __restrict__ posq,
+    const PMEFloat4* __restrict__ cmap_energy,
+    int cmap_term_stride,
+    int cmap_row_stride,
+    unsigned long long* __restrict__ force,
+    int stride) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= ncmaps) return;
+
+  const CupoCmapTerm t = terms[idx];
+  const float4 rI = posq[t.a[0]];
+  const float4 rJ = posq[t.a[1]];
+  const float4 rK = posq[t.a[2]];
+  const float4 rL = posq[t.a[3]];
+  const float4 rM = posq[t.a[4]];
+
+  const float xij = rI.x - rJ.x;
+  const float yij = rI.y - rJ.y;
+  const float zij = rI.z - rJ.z;
+  const float xkj = rK.x - rJ.x;
+  const float ykj = rK.y - rJ.y;
+  const float zkj = rK.z - rJ.z;
+  const float xlk = rL.x - rK.x;
+  const float ylk = rL.y - rK.y;
+  const float zlk = rL.z - rK.z;
+
+  // Phi dihedral I-J-K-L and derivatives wrt I, J, K, L
+  const float oneOverRKJ = rsqrtf(xkj * xkj + ykj * ykj + zkj * zkj);
+  const float uxkj = xkj * oneOverRKJ;
+  const float uykj = ykj * oneOverRKJ;
+  const float uzkj = zkj * oneOverRKJ;
+  float dotIJKJ = xij * uxkj + yij * uykj + zij * uzkj;
+  float upxij = xij - dotIJKJ * uxkj;
+  float upyij = yij - dotIJKJ * uykj;
+  float upzij = zij - dotIJKJ * uzkj;
+  dotIJKJ *= oneOverRKJ;
+  const float oneOverRUIJ = rsqrtf(upxij * upxij + upyij * upyij + upzij * upzij);
+  upxij *= oneOverRUIJ;
+  upyij *= oneOverRUIJ;
+  upzij *= oneOverRUIJ;
+
+  float dotLKKJ = xlk * uxkj + ylk * uykj + zlk * uzkj;
+  float upxlk = xlk - dotLKKJ * uxkj;
+  float upylk = ylk - dotLKKJ * uykj;
+  float upzlk = zlk - dotLKKJ * uzkj;
+  dotLKKJ *= oneOverRKJ;
+  const float oneOverRULK = rsqrtf(upxlk * upxlk + upylk * upylk + upzlk * upzlk);
+  upxlk *= oneOverRULK;
+  upylk *= oneOverRULK;
+  upzlk *= oneOverRULK;
+
+  float dot = upxij * upxlk + upyij * upylk + upzij * upzlk;
+  const float cosphi = fminf(fmaxf(dot, -1.0f), 1.0f);
+  float cx = upyij * upzlk - upzij * upylk;
+  float cy = upzij * upxlk - upxij * upzlk;
+  float cz = upxij * upylk - upyij * upxlk;
+  dot = cx * uxkj + cy * uykj + cz * uzkj;
+  const float sinphi = fminf(fmaxf(dot, -1.0f), 1.0f);
+  float phi = acosf(cosphi) * (sinphi >= 0.0f ? 1.0f : -1.0f);
+
+  float upxijk = (uzkj * upyij - uykj * upzij) * oneOverRUIJ;
+  float upyijk = (uxkj * upzij - uzkj * upxij) * oneOverRUIJ;
+  float upzijk = (uykj * upxij - uxkj * upyij) * oneOverRUIJ;
+  float upxjkl = (uykj * upzlk - uzkj * upylk) * oneOverRULK;
+  float upyjkl = (uzkj * upxlk - uxkj * upzlk) * oneOverRULK;
+  float upzjkl = (uxkj * upylk - uykj * upxlk) * oneOverRULK;
+
+  // Psi dihedral J-K-L-M and derivatives wrt J, K, L, M
+  const float oneOverRLK = rsqrtf(xlk * xlk + ylk * ylk + zlk * zlk);
+  const float uxlk = xlk * oneOverRLK;
+  const float uylk = ylk * oneOverRLK;
+  const float uzlk = zlk * oneOverRLK;
+  float dotJKLK = xkj * uxlk + ykj * uylk + zkj * uzlk;
+  float upxjk = -xkj + dotJKLK * uxlk;
+  float upyjk = -ykj + dotJKLK * uylk;
+  float upzjk = -zkj + dotJKLK * uzlk;
+  dotJKLK *= oneOverRLK;
+  const float oneOverRUJK = rsqrtf(upxjk * upxjk + upyjk * upyjk + upzjk * upzjk);
+  upxjk *= oneOverRUJK;
+  upyjk *= oneOverRUJK;
+  upzjk *= oneOverRUJK;
+
+  const float xml = rM.x - rL.x;
+  const float yml = rM.y - rL.y;
+  const float zml = rM.z - rL.z;
+  float dotMLLK = xml * uxlk + yml * uylk + zml * uzlk;
+  float upxml = xml - dotMLLK * uxlk;
+  float upyml = yml - dotMLLK * uylk;
+  float upzml = zml - dotMLLK * uzlk;
+  dotMLLK *= oneOverRLK;
+  const float oneOverRUML = rsqrtf(upxml * upxml + upyml * upyml + upzml * upzml);
+  upxml *= oneOverRUML;
+  upyml *= oneOverRUML;
+  upzml *= oneOverRUML;
+
+  dot = upxjk * upxml + upyjk * upyml + upzjk * upzml;
+  const float cospsi = fminf(fmaxf(dot, -1.0f), 1.0f);
+  cx = upyjk * upzml - upzjk * upyml;
+  cy = upzjk * upxml - upxjk * upzml;
+  cz = upxjk * upyml - upyjk * upxml;
+  dot = cx * uxlk + cy * uylk + cz * uzlk;
+  const float sinpsi = fminf(fmaxf(dot, -1.0f), 1.0f);
+  float psi = acosf(cospsi) * (sinpsi >= 0.0f ? 1.0f : -1.0f);
+
+  float upxjkl1 = (upyjk * uzlk - upzjk * uylk) * oneOverRUJK;
+  float upyjkl1 = (upzjk * uxlk - upxjk * uzlk) * oneOverRUJK;
+  float upzjkl1 = (upxjk * uylk - upyjk * uxlk) * oneOverRUJK;
+  float upxklm = (uylk * upzml - uzlk * upyml) * oneOverRUML;
+  float upyklm = (uzlk * upxml - uxlk * upzml) * oneOverRUML;
+  float upzklm = (uxlk * upyml - uylk * upxml) * oneOverRUML;
+
+  // Map [-pi, pi] -> periodic 24x24 spline grid [0, 24)
+  static const float kPiF = 3.14159265358979323846f;
+  static const float kGridPerRad = static_cast<float>(CMAP_RESOLUTION) / (2.0f * kPiF);
+  phi += kPiF;
+  psi += kPiF;
+  const float phi_s = phi * kGridPerRad;
+  const float psi_s = psi * kGridPerRad;
+  int gx = static_cast<int>(floorf(phi_s));
+  int gy = static_cast<int>(floorf(psi_s));
+  const float phifrac = phi_s - static_cast<float>(gx);
+  const float psifrac = psi_s - static_cast<float>(gy);
+  gx = ((gx % CMAP_RESOLUTION) + CMAP_RESOLUTION) % CMAP_RESOLUTION;
+  gy = ((gy % CMAP_RESOLUTION) + CMAP_RESOLUTION) % CMAP_RESOLUTION;
+
+  const PMEFloat4* pSrc =
+      cmap_energy + t.type + gy * cmap_row_stride + gx * cmap_term_stride;
+  const PMEFloat4 E00 = pSrc[0];
+  const PMEFloat4 E01 = pSrc[cmap_row_stride];
+  const PMEFloat4 E10 = pSrc[cmap_term_stride];
+  const PMEFloat4 E11 = pSrc[cmap_row_stride + cmap_term_stride];
+
+  const float a10 = E00.y;
+  const float a20 = (-3.0f * E00.x) + (3.0f * E10.x) - (2.0f * E00.y) - E10.y;
+  const float a30 = (2.0f * E00.x) - (2.0f * E10.x) + E00.y + E10.y;
+  const float a01 = E00.z;
+  const float a11 = E00.w;
+  const float a21 = (-3.0f * E00.z) + (3.0f * E10.z) - (2.0f * E00.w) - E10.w;
+  const float a31 = (2.0f * E00.z) - (2.0f * E10.z) + E00.w + E10.w;
+  const float a02 = (-3.0f * E00.x) + (3.0f * E01.x) - (2.0f * E00.z) - E01.z;
+  const float a12 = (-3.0f * E00.y) + (3.0f * E01.y) - (2.0f * E00.w) - E01.w;
+  const float a22 = (9.0f * (E00.x - E10.x - E01.x + E11.x)) +
+                    (6.0f * E00.y) + (3.0f * E10.y) - (6.0f * E01.y) - (3.0f * E11.y) +
+                    (6.0f * E00.z) - (6.0f * E10.z) + (3.0f * E01.z) - (3.0f * E11.z) +
+                    (4.0f * E00.w) + (2.0f * E10.w) + (2.0f * E01.w) + E11.w;
+  const float a32 = (-6.0f * (E00.x - E10.x - E01.x + E11.x)) +
+                    (-3.0f * (E00.y + E10.y - E01.y - E11.y)) +
+                    (-4.0f * E00.z) + (4.0f * E10.z) - E01.w - E11.w +
+                    (-2.0f * (E00.w + E10.w + E01.z - E11.z));
+  const float a03 = (2.0f * E00.x) - (2.0f * E01.x) + E00.z + E01.z;
+  const float a13 = (2.0f * E00.y) - (2.0f * E01.y) + E00.w + E01.w;
+  const float a23 = (-6.0f * (E00.x - E10.x - E01.x + E11.x)) +
+                    (-2.0f * (E00.w + E10.y + E01.w - E11.y)) +
+                    (-3.0f * (E00.z - E10.z + E01.z - E11.z)) +
+                    (-4.0f * E00.y) - E10.w + (4.0f * E01.y) - E11.w;
+  const float a33 = (4.0f * (E00.x - E10.x - E01.x + E11.x)) +
+                    (2.0f * (E00.y + E10.y - E01.y - E11.y)) +
+                    (2.0f * (E00.z - E10.z + E01.z - E11.z)) +
+                    E00.w + E10.w + E01.w + E11.w;
+
+  float dPhi = (3.0f * a33 * phifrac + 2.0f * a23) * phifrac + a13;
+  dPhi = (3.0f * a32 * phifrac + 2.0f * a22) * phifrac + a12 + dPhi * psifrac;
+  dPhi = (3.0f * a31 * phifrac + 2.0f * a21) * phifrac + a11 + dPhi * psifrac;
+  dPhi = (3.0f * a30 * phifrac + 2.0f * a20) * phifrac + a10 + dPhi * psifrac;
+
+  float dPsi = (3.0f * a33 * psifrac + 2.0f * a32) * psifrac + a31;
+  dPsi = (3.0f * a23 * psifrac + 2.0f * a22) * psifrac + a21 + dPsi * phifrac;
+  dPsi = (3.0f * a13 * psifrac + 2.0f * a12) * psifrac + a11 + dPsi * phifrac;
+  dPsi = (3.0f * a03 * psifrac + 2.0f * a02) * psifrac + a01 + dPsi * phifrac;
+
+  // Convert kcal/(mol*cell) -> kJ/(mol*rad); geometric vectors already in nm^-1 -> kJ/(mol*nm)
+  static const float kCmapToKjRad =
+      (180.0f / (static_cast<float>(CMAP_STEP_SIZE) * kPiF)) * 4.184f;
+  dPhi *= kCmapToKjRad;
+  dPsi *= kCmapToKjRad;
+
+  upxijk *= dPhi;
+  upyijk *= dPhi;
+  upzijk *= dPhi;
+  upxjkl *= dPhi;
+  upyjkl *= dPhi;
+  upzjkl *= dPhi;
+  upxjkl1 *= dPsi;
+  upyjkl1 *= dPsi;
+  upzjkl1 *= dPsi;
+  upxklm *= dPsi;
+  upyklm *= dPsi;
+  upzklm *= dPsi;
+
+  const double vx = static_cast<double>(dotIJKJ) * upxijk + static_cast<double>(dotLKKJ) * upxjkl;
+  const double vy = static_cast<double>(dotIJKJ) * upyijk + static_cast<double>(dotLKKJ) * upyjkl;
+  const double vz = static_cast<double>(dotIJKJ) * upzijk + static_cast<double>(dotLKKJ) * upzjkl;
+  const double wx = -static_cast<double>(dotJKLK) * upxjkl1 + static_cast<double>(dotMLLK) * upxklm;
+  const double wy = -static_cast<double>(dotJKLK) * upyjkl1 + static_cast<double>(dotMLLK) * upyklm;
+  const double wz = -static_cast<double>(dotJKLK) * upzjkl1 + static_cast<double>(dotMLLK) * upzklm;
+
+  static const double kCupoScale = 4294967296.0;
+  const long long iupxijk  = llrint(static_cast<double>(upxijk)  * kCupoScale);
+  const long long iupyijk  = llrint(static_cast<double>(upyijk)  * kCupoScale);
+  const long long iupzijk  = llrint(static_cast<double>(upzijk)  * kCupoScale);
+  const long long iupxjkl  = llrint(static_cast<double>(upxjkl)  * kCupoScale);
+  const long long iupyjkl  = llrint(static_cast<double>(upyjkl)  * kCupoScale);
+  const long long iupzjkl  = llrint(static_cast<double>(upzjkl)  * kCupoScale);
+  const long long iupxjkl1 = llrint(static_cast<double>(upxjkl1) * kCupoScale);
+  const long long iupyjkl1 = llrint(static_cast<double>(upyjkl1) * kCupoScale);
+  const long long iupzjkl1 = llrint(static_cast<double>(upzjkl1) * kCupoScale);
+  const long long iupxklm  = llrint(static_cast<double>(upxklm)  * kCupoScale);
+  const long long iupyklm  = llrint(static_cast<double>(upyklm)  * kCupoScale);
+  const long long iupzklm  = llrint(static_cast<double>(upzklm)  * kCupoScale);
+  const long long ivx = llrint(vx * kCupoScale);
+  const long long ivy = llrint(vy * kCupoScale);
+  const long long ivz = llrint(vz * kCupoScale);
+  const long long iwx = llrint(wx * kCupoScale);
+  const long long iwy = llrint(wy * kCupoScale);
+  const long long iwz = llrint(wz * kCupoScale);
+
+  addCmapAtomForce(force, t.a[0], stride, -iupxijk, -iupyijk, -iupzijk);
+  addCmapAtomForce(force, t.a[1], stride, iupxijk - ivx - iupxjkl1,
+                   iupyijk - ivy - iupyjkl1, iupzijk - ivz - iupzjkl1);
+  addCmapAtomForce(force, t.a[2], stride, ivx + iupxjkl - iwx + iupxjkl1,
+                   ivy + iupyjkl - iwy + iupyjkl1, ivz + iupzjkl - iwz + iupzjkl1);
+  addCmapAtomForce(force, t.a[3], stride, iupxklm + iwx - iupxjkl,
+                   iupyklm + iwy - iupyjkl, iupzklm + iwz - iupzjkl);
+  addCmapAtomForce(force, t.a[4], stride, -iupxklm, -iupyklm, -iupzklm);
+}
+
 // ============================================================================
 // Persistent Integration State
 // ============================================================================
@@ -469,11 +760,16 @@ struct CupoState {
   bool active = false;
   bool is_prolate = true;
 
-  // Stage 2A (bonded + 1-4 tuples) and Stage 2B (whole-step GPU batching)
+  // Stage 2A (bonded + 1-4 tuples + CMAP) and Stage 2B (whole-step GPU batching)
   unsigned int rng_seed = 71277u;
   bool bonded_active = false;
   bool whole_step_active = false;
   cupo_tuples_handle tuples = nullptr;
+  int ncmaps = 0;
+  CupoCmapTerm* d_cmap_terms = nullptr;
+  const PMEFloat4* d_cmap_energy = nullptr;  // borrowed from gpu->sim.pCmapEnergy
+  int cmap_term_stride = 0;
+  int cmap_row_stride = 0;
   cudaEvent_t tuples_done_event = nullptr;
   CupoIntegratorState* integ = nullptr;
   int whole_chunk_size = 8;
@@ -639,6 +935,7 @@ static void freeRuntimeState(CupoState& s) {
   freeDev(s.d_kspace_arena);
   freeDev(s.d_dspace_arena);
   freeDev(s.d_cl_arena);
+  freeDev(s.d_cmap_terms);
   freeDev(s.d_energy);
   freeDev(s.d_cupo_force);
   freeDev(s.d_posq);
@@ -650,6 +947,11 @@ static void freeRuntimeState(CupoState& s) {
   s.d_kspace_arena = nullptr;
   s.d_dspace_arena = nullptr;
   s.d_cl_arena = nullptr;
+  s.d_cmap_terms = nullptr;
+  s.d_cmap_energy = nullptr;
+  s.cmap_term_stride = 0;
+  s.cmap_row_stride = 0;
+  s.ncmaps = 0;
   s.d_energy = nullptr;
   s.d_cupo_force = nullptr;
   s.d_posq = nullptr;
@@ -803,16 +1105,16 @@ static bool checkSupportedSimulation(gpuContext gpu, std::string* reason) {
     return false;
   }
   if (gpu->sim.icnstph != 0 || gpu->sim.icnste != 0 ||
-      gpu->iphmd != 0 || gpu->sim.iphmd != 0) {
+      getIphmd(gpu, 0) != 0 || getIphmd(&gpu->sim, 0) != 0) {
     *reason = "constant pH / redox / PHMD active";
     return false;
   }
-  if (gpu->sim.isgld != 0) {
+  if (getIsgld(&gpu->sim, 0) != 0) {
     *reason = "SGLD active";
     return false;
   }
-  if (gpu->sim.EPs > 0) {
-    *reason = "extra points (EPs > 0) active";
+  if (gpu->sim.EPs > 0 && gpu->sim.pNBForceAccumulator != gpu->sim.pForceAccumulator) {
+    *reason = "extra points with split nonbond force accumulator";
     return false;
   }
   if (gpu->imin != 0) {
@@ -850,7 +1152,8 @@ static bool checkSupportedSimulation(gpuContext gpu, std::string* reason) {
   }
 #ifdef GTI
   if (gpu->sim.reafMode >= 0 || gpu->sim.numberLJ1264Atoms > 0 ||
-      gpu->sim.numberpLJ1264Atoms > 0 || gpu->sim.numberLJ1264pLJ1264Atoms > 0) {
+      getNumberpLJ1264Atoms(&gpu->sim, 0) > 0 ||
+      getNumberLJ1264pLJ1264Atoms(&gpu->sim, 0) > 0) {
     *reason = "REAF or LJ 12-6-4 interactions active";
     return false;
   }
@@ -893,6 +1196,9 @@ static void dispatchForceCore(CupoState& s,
   const int ce = computeEnergy ? 1 : 0;
   const int cf = 1;
   const bool run_tuples = includeTuples && s.bonded_active && (s.tuples != nullptr);
+  const bool run_cmap =
+      includeTuples && s.bonded_active &&
+      (s.ncmaps > 0 && s.d_cmap_terms != nullptr && s.d_cmap_energy != nullptr);
 
   CUPO_PMEMD_CUDA_CHECK(cudaEventRecord(s.step_fork_event, ws));
 
@@ -904,6 +1210,15 @@ static void dispatchForceCore(CupoState& s,
         s.tuples, s.d_posq, nullptr,
         reinterpret_cast<int64_t*>(s.d_cupo_force), s.stride,
         nullptr, 1u, s.misc_stream));
+  }
+  if (run_cmap) {
+    const int cblocks = (s.ncmaps + 127) / 128;
+    kCupoCmapForces_kernel<<<cblocks, 128, 0, s.misc_stream>>>(
+        s.ncmaps, s.d_cmap_terms, s.d_posq, s.d_cmap_energy,
+        s.cmap_term_stride, s.cmap_row_stride, s.d_cupo_force, s.stride);
+    CUPO_PMEMD_CUDA_CHECK(cudaGetLastError());
+  }
+  if (run_tuples || run_cmap) {
     CUPO_PMEMD_CUDA_CHECK(cudaEventRecord(s.tuples_done_event, s.misc_stream));
   }
 
@@ -937,7 +1252,7 @@ static void dispatchForceCore(CupoState& s,
 
   CUPO_PMEMD_CUDA_CHECK(cudaStreamWaitEvent(ws, s.kspace_done_event, 0));
   CUPO_PMEMD_CUDA_CHECK(cudaStreamWaitEvent(ws, s.dspace_done_event, 0));
-  if (run_tuples) {
+  if (run_tuples || run_cmap) {
     CUPO_PMEMD_CUDA_CHECK(cudaStreamWaitEvent(ws, s.tuples_done_event, 0));
   }
 }
@@ -980,17 +1295,17 @@ static bool tryInitBondedTuples(CupoState& s,
   if (!g_cupo.tuples_available) {
     return fail("libcupo.so lacks cupo_tuples_* symbols");
   }
-  if (gpu->iphmd > 0) {
+  if (getIphmd(gpu, 0) > 0) {
     return fail("PHMD active");
   }
   if (gpu->sim.bJar) {
     return fail("Jarzynski sampling active");
   }
-  if (gpu->sim.cmaps > 0 || gpu->sim.impDihedrals > 0 || gpu->sim.constraints > 0 ||
+  if (gpu->sim.impDihedrals > 0 || gpu->sim.constraints > 0 ||
       gpu->sim.NMRDistances > 0 || gpu->sim.NMRAngles > 0 || gpu->sim.NMRTorsions > 0 ||
       gpu->sim.NMRCOMDistances > 0 || gpu->sim.NMRr6avDistances > 0 ||
       gpu->sim.NMRCOMAngles > 0 || gpu->sim.NMRCOMTorsions > 0) {
-    return fail("unsupported bonded/restraint terms present (CMAP, CHARMM improper, ntr=1, or NMR)");
+    return fail("unsupported bonded/restraint terms present (CHARMM improper, ntr=1, or NMR)");
   }
 
   const int natoms = s.natoms;
@@ -1184,6 +1499,31 @@ static bool tryInitBondedTuples(CupoState& s,
     }
   }
 
+  // CMAP 5-atom bicubic spline terms (e.g. ff19SB)
+  std::vector<CupoCmapTerm> h_cmaps;
+  if (gpu->sim.cmaps > 0) {
+    if (!gpu->pbCmapID1 || !gpu->pbCmapID2 || !gpu->pbCmapType ||
+        !gpu->pbCmapEnergy || !gpu->sim.pCmapEnergy ||
+        gpu->sim.cmapTermStride <= 0 || gpu->sim.cmapRowStride <= 0) {
+      return fail("missing CMAP device buffers");
+    }
+    h_cmaps.reserve(static_cast<size_t>(gpu->sim.cmaps));
+    for (int i = 0; i < gpu->sim.cmaps; ++i) {
+      CupoCmapTerm ct = {};
+      const int4 id1 = gpu->pbCmapID1->_pSysData[i];
+      const int id2 = gpu->pbCmapID2->_pSysData[i];
+      const int ctype = gpu->pbCmapType->_pSysData[i];
+      if (!mapAtom(id1.x, &ct.a[0]) || !mapAtom(id1.y, &ct.a[1]) ||
+          !mapAtom(id1.z, &ct.a[2]) || !mapAtom(id1.w, &ct.a[3]) ||
+          !mapAtom(id2, &ct.a[4]) || ctype < 0 ||
+          ctype >= gpu->sim.cmapTermStride) {
+        return fail("invalid CMAP atom indices or type");
+      }
+      ct.type = ctype;
+      h_cmaps.push_back(ct);
+    }
+  }
+
   std::vector<cupo_tuples_term_batch> batches;
   if (!h_bonds.empty()) {
     cupo_tuples_term_batch b = {};
@@ -1214,22 +1554,30 @@ static bool tryInitBondedTuples(CupoState& s,
     batches.push_back(b);
   }
 
-  if (batches.empty()) {
-    s.tuples = nullptr;
-    s.bonded_active = true;
-    return true;
+  cupo_tuples_handle thandle = nullptr;
+  if (!batches.empty()) {
+    cupo_status tst = g_cupo.tuples_create(
+        natoms, static_cast<int>(batches.size()), batches.data(),
+        CUPO_TUPLES_FLOAT32, &thandle);
+    if (tst != CUPO_SUCCESS || !thandle) {
+      const char* err_msg = g_cupo.last_error ? g_cupo.last_error() : nullptr;
+      if (reason) {
+        *reason = std::string("cupo_tuples_create failed: ") + (err_msg ? err_msg : "unknown");
+      }
+      return false;
+    }
   }
 
-  cupo_tuples_handle thandle = nullptr;
-  cupo_status tst = g_cupo.tuples_create(
-      natoms, static_cast<int>(batches.size()), batches.data(),
-      CUPO_TUPLES_FLOAT32, &thandle);
-  if (tst != CUPO_SUCCESS || !thandle) {
-    const char* err_msg = g_cupo.last_error ? g_cupo.last_error() : nullptr;
-    if (reason) {
-      *reason = std::string("cupo_tuples_create failed: ") + (err_msg ? err_msg : "unknown");
-    }
-    return false;
+  if (!h_cmaps.empty()) {
+    CUPO_PMEMD_CUDA_CHECK(cudaMalloc(
+        &s.d_cmap_terms, h_cmaps.size() * sizeof(CupoCmapTerm)));
+    CUPO_PMEMD_CUDA_CHECK(cudaMemcpy(
+        s.d_cmap_terms, h_cmaps.data(), h_cmaps.size() * sizeof(CupoCmapTerm),
+        cudaMemcpyHostToDevice));
+    s.d_cmap_energy = gpu->sim.pCmapEnergy;
+    s.cmap_term_stride = gpu->sim.cmapTermStride;
+    s.cmap_row_stride = gpu->sim.cmapRowStride;
+    s.ncmaps = static_cast<int>(h_cmaps.size());
   }
 
   s.tuples = thandle;
@@ -1710,7 +2058,7 @@ bool cupo_pmemd_try_init(gpuContext gpu) {
 
   std::printf(
       "[cuPotential] Active: libcupo %s, splitting=%s, cutoff=%.3f nm, "
-      "mesh=%dx%dx%d, compact=%s/%s/%s, atoms=%d, excl=%d, ntp=%d (safety=%.2f), "
+      "mesh=%dx%dx%d, compact=%s/%s/%s, atoms=%d, excl=%d, cmaps=%d, eps=%d, ntp=%d (safety=%.2f), "
       "graph=%d, bonded=%d, whole_step=%d (chunk=%d)\n",
       g_cupo.version_string(),
       is_prolate ? "prolate" : "ewald",
@@ -1719,8 +2067,9 @@ bool cupo_pmemd_try_init(gpuContext gpu) {
       cinfo.backend[0] == CUPO_KSPACE_BACKEND_COMPACT ? "compact" : "cuFFT",
       cinfo.backend[1] == CUPO_KSPACE_BACKEND_COMPACT ? "compact" : "cuFFT",
       cinfo.backend[2] == CUPO_KSPACE_BACKEND_COMPACT ? "compact" : "cuFFT",
-      natoms, n_excl, gpu->sim.ntp, box_safety, s.graph_enabled ? 1 : 0,
-      s.bonded_active ? 1 : 0, s.whole_step_active ? 1 : 0, s.whole_chunk_size);
+      natoms, n_excl, gpu->sim.cmaps, gpu->sim.EPs, gpu->sim.ntp, box_safety,
+      s.graph_enabled ? 1 : 0, s.bonded_active ? 1 : 0, s.whole_step_active ? 1 : 0,
+      s.whole_chunk_size);
   if (!s.bonded_active) {
     std::printf("[cuPotential] Info: Stage 2A bonded fallback to Amber (%s)\n",
                 bonded_reason.c_str());
@@ -1823,7 +2172,7 @@ void cupo_pmemd_launch_step(gpuContext gpu, bool needEnergy) {
                    cudaGetErrorString(end_err));
     } else {
       cudaGraphExec_t exec = nullptr;
-      cudaError_t inst_err = cudaGraphInstantiate(&exec, captured, 0);
+      cudaError_t inst_err = cupoGraphInstantiate(&exec, captured);
       if (inst_err != cudaSuccess) {
         cudaGraphDestroy(captured);
         s.graph_enabled = false;
@@ -1946,7 +2295,7 @@ static void runWholeStepUnit(CupoState& s, GraphSlot& slot, int nsteps, bool app
       return;
     }
     cudaGraphExec_t exec = nullptr;
-    cudaError_t inst_err = cudaGraphInstantiate(&exec, captured, 0);
+    cudaError_t inst_err = cupoGraphInstantiate(&exec, captured);
     if (inst_err != cudaSuccess) {
       cudaGraphDestroy(captured);
       s.graph_enabled = false;

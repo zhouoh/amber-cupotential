@@ -166,36 +166,29 @@ def make_mdin(
 
 def parse_steps(mdout_text: str) -> Dict[int, dict]:
     body = mdout_text.split("A V E R A G E S")[0]
-    pat = re.compile(
+    block_pat = re.compile(
         r"NSTEP\s*=\s*(\d+)\s+TIME\(PS\)\s*=\s*([\d.-]+)\s+TEMP\(K\)\s*=\s*([\d.-]+)\s+PRESS\s*=\s*([\d.-]+)\s*\n"
-        r"\s*Etot\s*=\s*([\d.-]+)\s+EKtot\s*=\s*([\d.-]+)\s+EPtot\s*=\s*([\d.-]+)\s*\n"
-        r"\s*BOND\s*=\s*([\d.-]+)\s+ANGLE\s*=\s*([\d.-]+)\s+DIHED\s*=\s*([\d.-]+)\s*\n"
-        r"\s*1-4 NB\s*=\s*([\d.-]+)\s+1-4 EEL\s*=\s*([\d.-]+)\s+VDWAALS\s*=\s*([\d.-]+)\s*\n"
-        r"\s*EELEC\s*=\s*([\d.-]+)\s+EHBOND\s*=\s*([\d.-]+)\s+RESTRAINT\s*=\s*([\d.-]+)"
-        r"(?:\s*\n(?:\s*EKCMT\s*=\s*[\d.-]+\s+VIRIAL\s*=\s*[\d.-]+\s+VOLUME\s*=\s*([\d.-]+))?"
-        r"(?:\s*\n\s*Density\s*=\s*([\d.-]+))?)?"
+        r"([\s\S]*?)(?=\n\s*-----|\n\s*A V E R A G E S|$)"
     )
+    kv_pat = re.compile(
+        r"(Etot|EKtot|EPtot|BOND|ANGLE|DIHED|1-4 NB|1-4 EEL|VDWAALS|EELEC|EHBOND|RESTRAINT|UB|IMP|CMAP|VOLUME|Density)"
+        r"\s*=\s*([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)"
+    )
+    rename = {"1-4 NB": "14_NB", "1-4 EEL": "14_EEL"}
     records = {}
-    for m in pat.finditer(body):
+    for m in block_pat.finditer(body):
         nstep = int(m.group(1))
-        records[nstep] = {
+        rec = {
             "nstep": nstep,
             "TIME": float(m.group(2)),
             "TEMP": float(m.group(3)),
             "PRESS": float(m.group(4)),
-            "Etot": float(m.group(5)),
-            "EKtot": float(m.group(6)),
-            "EPtot": float(m.group(7)),
-            "BOND": float(m.group(8)),
-            "ANGLE": float(m.group(9)),
-            "DIHED": float(m.group(10)),
-            "14_NB": float(m.group(11)),
-            "14_EEL": float(m.group(12)),
-            "VDWAALS": float(m.group(13)),
-            "EELEC": float(m.group(14)),
-            "VOLUME": float(m.group(17)) if m.group(17) else None,
-            "Density": float(m.group(18)) if m.group(18) else None,
+            "VOLUME": None,
+            "Density": None,
         }
+        for k, v in kv_pat.findall(m.group(5)):
+            rec[rename.get(k, k)] = float(v)
+        records[nstep] = rec
     return records
 
 
@@ -213,7 +206,9 @@ def read_netcdf_forces_first(path: pathlib.Path) -> np.ndarray:
     return frc
 
 
-def parse_prmtop_h_bonds(parm_path: pathlib.Path) -> Tuple[int, List[Tuple[int, int, float]]]:
+def parse_prmtop_topology(
+    parm_path: pathlib.Path,
+) -> Tuple[int, List[Tuple[int, int, float]], int, List[Tuple[int, int, int, int]]]:
     text = parm_path.read_text(encoding="utf-8").splitlines()
     sections: Dict[str, List[str]] = {}
     cur = None
@@ -224,8 +219,14 @@ def parse_prmtop_h_bonds(parm_path: pathlib.Path) -> Tuple[int, List[Tuple[int, 
         elif line.startswith("%FORMAT") or cur is None:
             continue
         else:
-            sections[cur].extend(line.split())
+            if cur in ("ATOM_NAME", "RESIDUE_LABEL", "AMBER_ATOM_TYPE"):
+                for idx in range(0, len(line), 4):
+                    sections[cur].append(line[idx : idx + 4].strip())
+            else:
+                sections[cur].extend(line.split())
     natoms = int(sections["POINTERS"][0])
+    nres = int(sections["POINTERS"][11])
+    masses = [float(x) for x in sections["MASS"][:natoms]]
     req = [float(x) for x in sections["BOND_EQUIL_VALUE"]]
     b_raw = [int(x) for x in sections["BONDS_INC_HYDROGEN"]]
     bonds = []
@@ -233,8 +234,18 @@ def parse_prmtop_h_bonds(parm_path: pathlib.Path) -> Tuple[int, List[Tuple[int, 
         i = abs(b_raw[k]) // 3
         j = abs(b_raw[k + 1]) // 3
         itype = b_raw[k + 2] - 1
-        bonds.append((i, j, req[itype]))
-    return natoms, bonds
+        if masses[i] > 0.0 and masses[j] > 0.0:
+            bonds.append((i, j, req[itype]))
+    ncmaps = int(sections["CMAP_COUNT"][0]) if "CMAP_COUNT" in sections else 0
+    ep_waters = []
+    res_labels = sections.get("RESIDUE_LABEL", [])[:nres]
+    res_ptrs = [int(x) - 1 for x in sections.get("RESIDUE_POINTER", [])[:nres]] + [natoms]
+    for r in range(min(nres, len(res_labels))):
+        if res_labels[r] in ("WAT", "HOH"):
+            a0, a1 = res_ptrs[r], res_ptrs[r + 1]
+            if a1 - a0 == 4 and masses[a0 + 3] == 0.0:
+                ep_waters.append((a0, a0 + 1, a0 + 2, a0 + 3))
+    return natoms, bonds, ncmaps, ep_waters
 
 
 def max_h_bond_deviation(coords: np.ndarray, box_lengths: np.ndarray, h_bonds) -> Tuple[float, float]:
@@ -249,6 +260,29 @@ def max_h_bond_deviation(coords: np.ndarray, box_lengths: np.ndarray, h_bonds) -
         if dev > max_dev:
             max_dev = dev
     return max_dev, float(np.mean(devs)) if devs else 0.0
+
+
+def max_ep_water_deviation(
+    coords: np.ndarray, box_lengths: np.ndarray, ep_waters: List[Tuple[int, int, int, int]], ref_ep_dist: float
+) -> Tuple[float, float]:
+    max_dist_dev = 0.0
+    max_bis_dev = 0.0
+    for o, h1, h2, ep in ep_waters:
+        v1 = coords[h1] - coords[o]
+        v2 = coords[h2] - coords[o]
+        ve = coords[ep] - coords[o]
+        v1 -= box_lengths * np.round(v1 / box_lengths)
+        v2 -= box_lengths * np.round(v2 / box_lengths)
+        ve -= box_lengths * np.round(ve / box_lengths)
+        dist_dev = abs(float(np.linalg.norm(ve)) - ref_ep_dist)
+        u = v1 / np.linalg.norm(v1)
+        v = v2 / np.linalg.norm(v2)
+        bis = u + v
+        ep_ideal = ref_ep_dist * (bis / np.linalg.norm(bis))
+        bis_dev = float(np.linalg.norm(ve - ep_ideal))
+        max_dist_dev = max(max_dist_dev, dist_dev)
+        max_bis_dev = max(max_bis_dev, bis_dev)
+    return max_dist_dev, max_bis_dev
 
 
 def fmt_section_i8(vals: List[int]) -> str:
@@ -662,9 +696,19 @@ def main() -> int:
         print("Synthesizing self-contained 2,114-atom n-butane + 700 TIP3P water system...")
         parm, crd = synthesize_butane_water_system(work_dir / "synth_system", pmemd_bin, args.gpu)
 
-    natoms, h_bonds = parse_prmtop_h_bonds(parm)
+    natoms, h_bonds, ncmaps, ep_waters = parse_prmtop_topology(parm)
     hmr_parm = pathlib.Path(args.hmr_parm).resolve() if args.hmr_parm else None
-    results = {"natoms": natoms, "h_bonds": len(h_bonds), "checks": {}}
+    ref_ep_dist = None
+    if ep_waters:
+        c0, _, b0 = read_netcdf_restart(crd)
+        dists = []
+        for o, _, _, ep in ep_waters:
+            ve = c0[ep] - c0[o]
+            if b0 is not None:
+                ve -= b0 * np.round(ve / b0)
+            dists.append(float(np.linalg.norm(ve)))
+        ref_ep_dist = float(np.mean(dists))
+    results = {"natoms": natoms, "h_bonds": len(h_bonds), "cmaps": ncmaps, "ep_waters": len(ep_waters), "checks": {}}
 
     # Note: intentionally do NOT override CUPO_LIB_PATH / CUPO_CUDA13_LIB_DIR so
     # runtime auto-discovery inside cupo_nonbond.cu is verified as well.
@@ -701,7 +745,10 @@ def main() -> int:
     )
     e_stk = parse_steps(m_ene_stk)[1]
     e_2a = parse_steps(m_ene_2a)[1]
-    bonded_diffs = {k: abs(e_2a[k] - e_stk[k]) for k in ["BOND", "ANGLE", "DIHED", "14_NB", "14_EEL"]}
+    term_keys = ["BOND", "ANGLE", "DIHED", "14_NB", "14_EEL"]
+    if ncmaps > 0 and "CMAP" in e_stk and "CMAP" in e_2a:
+        term_keys.append("CMAP")
+    bonded_diffs = {k: abs(e_2a[k] - e_stk[k]) for k in term_keys}
     results["checks"]["stage2a_force_energy"] = {
         "rmse_2a_vs_p1": rmse_2a_p1,
         "relL2_2a_vs_p1": rel_2a_p1,
@@ -729,12 +776,19 @@ def main() -> int:
     drift_per_atom = abs(d_etot) / natoms
     c_nve, _, box_nve = read_netcdf_restart(d_nve / "restrt")
     max_hb_dev, mean_hb_dev = max_h_bond_deviation(c_nve, box_nve, h_bonds)
-    results["checks"]["stage2b_nve"] = {
+    nve_res = {
         "dEtot": d_etot,
         "abs_dEtot_per_atom": drift_per_atom,
         "max_hbond_dev_A": max_hb_dev,
         "mean_hbond_dev_A": mean_hb_dev,
     }
+    if ep_waters and ref_ep_dist is not None:
+        max_ep_d, max_ep_b = max_ep_water_deviation(c_nve, box_nve, ep_waters, ref_ep_dist)
+        nve_res["max_ep_dist_dev_A"] = max_ep_d
+        nve_res["max_ep_bisector_dev_A"] = max_ep_b
+        assert max_ep_d < 1e-6, f"EP distance violation too large: {max_ep_d}"
+        assert max_ep_b < 1e-6, f"EP bisector violation too large: {max_ep_b}"
+    results["checks"]["stage2b_nve"] = nve_res
     assert drift_per_atom < 2e-3, f"NVE energy drift too large: {drift_per_atom}"
     assert max_hb_dev < 1e-5, f"H-bond constraint violation too large: {max_hb_dev}"
     print(f"  PASS: NVE dEtot={d_etot:+.4f} kcal/mol ({drift_per_atom:.2e}/atom), max H-bond dev={max_hb_dev:.2e} A")

@@ -50,7 +50,7 @@ struct alignas(8) fltflt {
            ((static_cast<unsigned int>(mant >> 28) + 1U) >> 1)));
       int r = static_cast<int>(static_cast<unsigned int>(mant) << 3);
       lo = __fmul_rn(
-          __fmul_rn(__int2float_rn(r), 0x1p-55f),
+          __fmul_rn(__int2float_rn(r), 2.7755575615628914e-17f),
           __int_as_float((sign << 31) | (static_cast<unsigned int>(hi_exp) << 23)));
       float s = __fadd_rn(hi, lo);
       lo = __fsub_rn(lo, __fsub_rn(s, hi));
