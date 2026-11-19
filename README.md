@@ -11,6 +11,54 @@ Out-of-tree integration bringing **NVIDIA cuPotential** acceleration to **Amber 
 
 ---
 
+## Benchmarks & 100 ns Validation (NVIDIA RTX 4090)
+
+Measured with `pmemd.cuda_SPFP` + `libcupo 0.3.5` (`chunk=8` CUDA Graph, steady-state `last_ns_day` over 50k steps for JAC and 20k steps for Factor IX):
+
+### 1. Throughput on Standard Amber Systems (`ns/day`)
+
+**JAC (DHFR in TIP3P water, 23,558 atoms)**
+
+| Protocol | Stock Amber24 | Phase 1 (NB) | Stage 2A (+Bonded) | Phase 2 Whole-Step (Prolate) | Speedup | Phase 2 (Ewald) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NVT Langevin (`cut=8 Å, dt=2 fs`) | `774.03` | `1220.24` | `2479.30` | **`3498.27`** | **`4.52x`** | `2771.79` |
+| NVT Langevin (`cut=9 Å, dt=2 fs`) | `692.10` | `1239.60` | — | **`3196.58`** | **`4.62x`** | `2841.73` |
+| NVT Middle (`cut=8 Å, dt=2 fs`) | `712.00` | `1086.33` | — | **`3093.88`** | **`4.35x`** | `2514.71` |
+| NPT MC100 (`cut=8 Å, dt=2 fs`) | `745.94` | `1240.89` | — | **`2691.69`** | **`3.61x`** | `2260.47` |
+| NPT MC100 (`cut=9 Å, dt=2 fs`) | `667.14` | `1228.85` | — | **`2661.10`** | **`3.99x`** | `2423.65` |
+| NVT HMR Middle (`cut=9 Å, dt=4 fs`) | `1067.89` | `2156.98` | `3663.79` | **`5613.00`** | **`5.26x`** | `5089.65` |
+
+**Factor IX (90,906 atoms)**
+
+| Protocol | Stock Amber24 | Phase 1 (NB) | Stage 2A (+Bonded) | Phase 2 Whole-Step (Prolate) | Speedup | Phase 2 (Ewald) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NVT Langevin (`cut=8 Å, dt=2 fs`) | `394.57` | `766.58` | `921.06` | **`1353.14`** | **`3.43x`** | `1061.88` |
+| NVT Langevin (`cut=9 Å, dt=2 fs`) | `370.95` | `740.00` | — | **`1271.24`** | **`3.43x`** | `1044.28` |
+| NVT Middle (`cut=8 Å, dt=2 fs`) | `352.86` | `629.18` | — | **`1299.41`** | **`3.68x`** | `1034.52` |
+| NPT MC100 (`cut=8 Å, dt=2 fs`) | `375.94` | `664.96` | — | **`1097.18`** | **`2.92x`** | `910.16` |
+| NPT MC100 (`cut=9 Å, dt=2 fs`) | `354.72` | `643.96` | — | **`1033.96`** | **`2.91x`** | `883.35` |
+| NVT HMR Middle (`cut=9 Å, dt=4 fs`) | `596.30` | `1220.08` | `1412.56` | **`2414.06`** | **`4.05x`** | `1992.20` |
+
+### 2. Long-Timescale 100 ns `JAC` NPT Structural & Thermodynamic Validation
+
+Continuous **100.0 ns (`50,000,000` steps, `dt=2 fs`, `cut=8 Å`, `barostat=2, mcbarint=100`, `300 K`)** production trajectories comparing Phase 2 Whole-Step (`Prolate, chunk=8`) against Stock Amber24 `pmemd.cuda_SPFP`, analyzed over the steady-state window **`20–100 ns`** (1,600 frames):
+
+![JAC 100 ns NPT Validation](docs/jac_100ns_comparison.png)
+
+| Observable (`20–100 ns` steady state) | Stock Amber24 | cuPotential Phase 2 | Agreement / Correlation |
+| --- | ---: | ---: | --- |
+| Sustained 100 ns wall-clock throughput | `747.58 ns/day` (`3.21 h`) | **`2,643.81 ns/day`** (`54.47 min`) | **`3.54x`** end-to-end speedup |
+| Temperature (`K`) | `300.04 ± 1.99` | `300.04 ± 1.93` | `Δ = 0.00 K` |
+| Bulk Density (`g/cm³`) | `1.0221 ± 0.0032` | `1.0225 ± 0.0031` | `+0.034%` |
+| Backbone Heavy-Atom RMSD (`@N,CA,C,O`, `Å`) | `2.430 ± 0.365` (`SEM 0.139`) | `2.303 ± 0.285` (`SEM 0.056`) | Within `1×` block-SEM |
+| Protein Radius of Gyration $R_g$ (`Å`) | `16.072 ± 0.138` | `16.064 ± 0.163` | `Δ = -0.008 Å` |
+| Per-residue $C_\alpha$ RMSF (`159` res, `Å`) | mean `1.187 Å` | mean `1.243 Å` | Spearman $\rho = 0.833$, `MAE = 0.281 Å` |
+| Ramachandran $\alpha$ / $\beta$ populations (`%`) | `40.27%` / `54.36%` | `40.74%` / `53.66%` | Per-res propensity $r = 0.946$ / $0.953$ |
+| Backbone H-bonds per frame (`N–H···O=C`) | `69.13 ± 3.39` | `69.69 ± 3.20` | Occupancy Pearson $r = 0.831$ |
+| Water O–O RDF $g_{\text{OO}}(r)$ 1st peak `(r₁, g₁)` | `(2.775 Å, 2.910)` | `(2.775 Å, 2.905)` | Full `0–8 Å` curve `RMSE = 0.00257` |
+
+---
+
 ## Architecture Overview
 
 Rather than relying on CUDA IPC or OpenMM wrappers, `amber-cupotential` bridges directly into Amber 24's `pmemd.cuda_SPFP` GPU context (`gpuContext`) across three stages:

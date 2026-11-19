@@ -4,8 +4,8 @@ message: "If you use this integration patch in your research, please cite this r
 type: software
 authors:
   - family-names: Zhou
-    given-names: Contributors
-repository-code: "https://github.com/your-org/amber-cupotential"
+    given-names: Qingyang
+repository-code: "https://github.com/zhouoh/amber-cupotential"
 license: Apache-2.0
 keywords:
   - molecular-dynamics
